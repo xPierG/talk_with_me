@@ -60,7 +60,30 @@ source .venv/bin/activate && streamlit run app.py
       my-rag-app
     ```
 
-## Deploy to Cloud Run
+## Deploy to Cloud Run (Automated)
+
+We provide a `deploy.sh` script to automate the deployment process to any Google Cloud project.
+
+1.  **Run the script**:
+    ```bash
+    ./deploy.sh
+    ```
+
+2.  **Follow the prompts**:
+    - Enter your **GCP Project ID**.
+    - Enter your **Gemini API Key** (input will be hidden).
+    - Select a **Region** (default: `us-central1`).
+
+The script will automatically:
+- Enable required APIs (Cloud Run, Cloud Build, Artifact Registry).
+- Build the Docker image using Cloud Build.
+- Deploy the service to Cloud Run.
+- Configure environment variables.
+
+## Deploy to Cloud Run (Manual)
+
+If you prefer to deploy manually:
+
 1.  **Build and Push**:
     ```bash
     gcloud builds submit --tag gcr.io/PROJECT_ID/my-rag-app
@@ -71,5 +94,6 @@ source .venv/bin/activate && streamlit run app.py
     gcloud run deploy my-rag-app \
       --image gcr.io/PROJECT_ID/my-rag-app \
       --platform managed \
-      --allow-unauthenticated
+      --allow-unauthenticated \
+      --set-env-vars "GOOGLE_API_KEY=your_key,GEMINI_MODEL_NAME=gemini-2.5-flash"
     ```
