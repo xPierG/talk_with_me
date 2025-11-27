@@ -246,7 +246,11 @@ class FileSearchRAG:
         if self.file_search_store:
             try:
                 logger.info(f"Deleting File Search store: {self.file_search_store.name}")
-                self.client.file_search_stores.delete(name=self.file_search_store.name)
+                # Use config={'force': True} to delete non-empty stores
+                self.client.file_search_stores.delete(
+                    name=self.file_search_store.name,
+                    config={'force': True}
+                )
                 logger.info("File Search store deleted")
             except Exception as e:
                 logger.error(f"Error deleting File Search store: {e}")
