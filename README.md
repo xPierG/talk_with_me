@@ -60,40 +60,35 @@ source .venv/bin/activate && streamlit run app.py
       my-rag-app
     ```
 
-## Deploy to Cloud Run (Automated)
+## Deployment
 
-We provide a `deploy.sh` script to automate the deployment process to any Google Cloud project.
+We provide two automated deployment scripts depending on your environment.
 
-1.  **Run the script**:
+### Option 1: Personal / Demo (API Key)
+Use this for personal projects or demos where you can use an API Key.
+
+**Prerequisites:**
+1.  Create a Secret in Google Cloud Secret Manager with your API Key:
     ```bash
-    ./deploy.sh
+    echo -n "YOUR_API_KEY" | gcloud secrets create gemini-api-key --data-file=-
     ```
 
-2.  **Follow the prompts**:
-    - Enter your **GCP Project ID**.
-    - Enter your **Gemini API Key** (input will be hidden).
-    - Select a **Region** (default: `us-central1`).
+**Deploy:**
+```bash
+./deploy_personal.sh
+```
+Follow the prompts to select your Project ID and Region.
 
-The script will automatically:
-- Enable required APIs (Cloud Run, Cloud Build, Artifact Registry).
-- Build the Docker image using Cloud Build.
-- Deploy the service to Cloud Run.
-- Configure environment variables.
+### Option 2: Enterprise (Vertex AI + IAM)
+Use this for corporate environments where API Keys are restricted. This mode uses **Vertex AI** and **IAM authentication**.
 
-## Deploy to Cloud Run (Manual)
+**Prerequisites:**
+1.  Ensure the **Cloud Run Service Account** has the `Vertex AI User` role (`roles/aiplatform.user`).
+    *   The script will tell you the Service Account email address.
+    *   You (or your admin) must grant this role manually via the GCP Console or IAM.
 
-If you prefer to deploy manually:
-
-1.  **Build and Push**:
-    ```bash
-    gcloud builds submit --tag gcr.io/PROJECT_ID/my-rag-app
-    ```
-
-2.  **Deploy**:
-    ```bash
-    gcloud run deploy my-rag-app \
-      --image gcr.io/PROJECT_ID/my-rag-app \
-      --platform managed \
-      --allow-unauthenticated \
-      --set-env-vars "GOOGLE_API_KEY=your_key,GEMINI_MODEL_NAME=gemini-2.5-flash"
-    ```
+**Deploy:**
+```bash
+./deploy_enterprise.sh
+```
+This will enable Vertex AI APIs and deploy the application configured to use IAM for authentication.

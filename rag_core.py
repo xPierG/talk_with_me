@@ -15,12 +15,35 @@ load_dotenv()
 
 class GeminiRAG:
     def __init__(self):
-        self.api_key = os.getenv("GOOGLE_API_KEY")
-        if not self.api_key:
-            raise ValueError("GOOGLE_API_KEY not found in environment variables")
-        genai.configure(api_key=self.api_key)
-        # Use Gemini 2.5 Flash (supports implicit caching by default)
+        self.use_vertex = os.getenv("USE_VERTEX_AI", "false").lower() == "true"
         self.model_name = os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash")
+        
+        if self.use_vertex:
+            import vertexai
+            from vertexai.generative_models import GenerativeModel, Part
+            self.project_id = os.getenv("PROJECT_ID")
+            self.location = os.getenv("LOCATION", "us-central1")
+            
+            if not self.project_id:
+                 # Try to get from gcloud if not set
+                try:
+                    import google.auth
+                    _, self.project_id = google.auth.default()
+                except:
+                    pass
+            
+            if not self.project_id:
+                raise ValueError("PROJECT_ID env var required for Vertex AI mode")
+                
+            logger.info(f"Initializing Vertex AI with project: {self.project_id}, location: {self.location}")
+            vertexai.init(project=self.project_id, location=self.location)
+            self.vertex_genai = vertexai.generative_models
+        else:
+            self.api_key = os.getenv("GOOGLE_API_KEY")
+            if not self.api_key:
+                raise ValueError("GOOGLE_API_KEY not found in environment variables")
+            genai.configure(api_key=self.api_key)
+            self.vertex_genai = None
 
     def upload_file(self, file_bytes, mime_type, file_name):
         """
@@ -31,34 +54,59 @@ class GeminiRAG:
         with open(tmp_path, "wb") as f:
             f.write(file_bytes)
         
-        logger.info(f"Uploading file: {file_name}")
-        try:
-            file_obj = genai.upload_file(path=tmp_path, mime_type=mime_type, display_name=file_name)
-        finally:
-            # Clean up local temp file
-            if tmp_path.exists():
-                tmp_path.unlink()
+        if self.use_vertex:
+            # Vertex AI Upload
+            # Vertex AI doesn't have a direct "upload_file" to a File API like AI Studio in the same way for simple usage
+            # BUT Gemini 1.5 on Vertex supports passing Part.from_uri or Part.from_data
+            # For this POC, we will use Part.from_data to send the file content directly in the prompt/context
+            # This is less efficient for huge files than the File API, but works without complex setup.
+            # Ideally we would upload to GCS and use Part.from_uri.
+            
+            # NOTE: For true Long Context on Vertex, uploading to GCS is the standard way.
+            # But to keep it simple and avoid GCS bucket setup in this script, we'll try passing data directly if small enough.
+            # If large, we should use GCS. Let's assume for this POC we use Part.from_data.
+            
+            logger.info(f"Processing file for Vertex AI: {file_name}")
+            # We return a simple object to mimic the file_obj interface
+            class VertexFile:
+                def __init__(self, name, data, mime_type):
+                    self.name = name
+                    self.data = data
+                    self.mime_type = mime_type
+                    self.display_name = name
+            
+            return VertexFile(file_name, file_bytes, mime_type)
+            
+        else:
+            # Google AI Studio Upload
+            logger.info(f"Uploading file: {file_name}")
+            try:
+                file_obj = genai.upload_file(path=tmp_path, mime_type=mime_type, display_name=file_name)
+            finally:
+                # Clean up local temp file
+                if tmp_path.exists():
+                    tmp_path.unlink()
 
-        # Poll for active state
-        logger.info(f"Waiting for file processing: {file_obj.name}")
-        start_time = time.time()
-        timeout_seconds = 60
+            # Poll for active state
+            logger.info(f"Waiting for file processing: {file_obj.name}")
+            start_time = time.time()
+            timeout_seconds = 60
 
-        while file_obj.state.name == "PROCESSING":
-            if time.time() - start_time > timeout_seconds:
-                raise TimeoutError(f"File processing timed out after {timeout_seconds} seconds")
-            time.sleep(2)
-            file_obj = genai.get_file(file_obj.name)
+            while file_obj.state.name == "PROCESSING":
+                if time.time() - start_time > timeout_seconds:
+                    raise TimeoutError(f"File processing timed out after {timeout_seconds} seconds")
+                time.sleep(2)
+                file_obj = genai.get_file(file_obj.name)
 
-        if file_obj.state.name == "FAILED":
-            raise ValueError(f"File processing failed: {file_obj.state.name}")
-        
-        if file_obj.state.name != "ACTIVE":
-             # Should not happen if we exit the loop correctly, but good for safety
-             raise ValueError(f"Unexpected file state: {file_obj.state.name}")
+            if file_obj.state.name == "FAILED":
+                raise ValueError(f"File processing failed: {file_obj.state.name}")
+            
+            if file_obj.state.name != "ACTIVE":
+                 # Should not happen if we exit the loop correctly, but good for safety
+                 raise ValueError(f"Unexpected file state: {file_obj.state.name}")
 
-        logger.info(f"File active: {file_obj.name}")
-        return file_obj
+            logger.info(f"File active: {file_obj.name}")
+            return file_obj
 
     def initialize_chat(self, file_obj):
         """
@@ -70,74 +118,78 @@ class GeminiRAG:
         
         model = None
         
-        try:
-            # Create a cache with a TTL of 60 minutes
-            logger.info("Attempting to create context cache...")
-            cache = caching.CachedContent.create(
-                model=self.model_name,
-                display_name=f"cache_{file_obj.name}",
-                system_instruction="You are a helpful assistant. Answer questions based on the provided document.",
-                contents=[file_obj],
-                ttl=3600 # 1 hour
-            )
-            logger.info(f"Cache created: {cache.name}")
-            model = genai.GenerativeModel.from_cached_content(cached_content=cache)
-        
-        except Exception as e:
-            logger.warning(f"Could not create context cache (likely file too small or model not supported): {e}")
-            logger.info("Falling back to standard file usage.")
+        if self.use_vertex:
+            # Vertex AI Chat Initialization
+            model = self.vertex_genai.GenerativeModel(self.model_name)
             
-            # Fallback: Standard model with file in history/context
-            # For standard usage, we don't pass the file to the model constructor directly in the same way as cache
-            # Instead, we usually pass it in the first message or system instruction, 
-            # but for 'chat', passing it in history or system_instruction is best.
-            
-            model = genai.GenerativeModel(
-                model_name=self.model_name,
-                system_instruction="You are a helpful assistant. Answer questions based on the provided document."
+            # Create Part from data
+            file_part = self.vertex_genai.Part.from_data(
+                data=file_obj.data,
+                mime_type=file_obj.mime_type
             )
             
-            # We will start the chat with the file in the history effectively by sending it? 
-            # Or better, we can just keep the file_obj and pass it in the history of start_chat if supported,
-            # but start_chat history expects Content objects.
-            # A common pattern for "Chat with Doc" without cache is to include the file in the history.
-            
-            # However, start_chat history is a list of protos or dicts.
-            # Let's try to initialize chat with the file as the first part of the context.
-            # But wait, if we use the file in `start_chat`, it persists.
-            
-            # Let's construct a valid history item for the file.
-            # Actually, `start_chat` history argument is convenient.
-            # We can put the file in the history as a "user" message.
-            
-            initial_history = [
-                {
-                    "role": "user",
-                    "parts": [file_obj]
-                },
-                {
-                    "role": "model",
-                    "parts": ["Understood. I have processed the document. What would you like to know?"]
-                }
-            ]
-            
-            chat = model.start_chat(history=initial_history)
+            # Start chat with file in history
+            chat = model.start_chat(history=[
+                self.vertex_genai.Content(role="user", parts=[file_part]),
+                self.vertex_genai.Content(role="model", parts=[self.vertex_genai.Part.from_text("I have processed the document.")])
+            ])
             return chat
 
-        # If cache was successful, we start chat on the cached model
-        # The cached content already includes the file, so we don't need to pass it again.
-        chat = model.start_chat(history=[])
-        return chat
+        else:
+            # Google AI Studio Chat Initialization
+            try:
+                # Create a cache with a TTL of 60 minutes
+                logger.info("Attempting to create context cache...")
+                cache = caching.CachedContent.create(
+                    model=self.model_name,
+                    display_name=f"cache_{file_obj.name}",
+                    system_instruction="You are a helpful assistant. Answer questions based on the provided document.",
+                    contents=[file_obj],
+                    ttl=3600 # 1 hour
+                )
+                logger.info(f"Cache created: {cache.name}")
+                model = genai.GenerativeModel.from_cached_content(cached_content=cache)
+            
+            except Exception as e:
+                logger.warning(f"Could not create context cache (likely file too small or model not supported): {e}")
+                logger.info("Falling back to standard file usage.")
+                
+                model = genai.GenerativeModel(
+                    model_name=self.model_name,
+                    system_instruction="You are a helpful assistant. Answer questions based on the provided document."
+                )
+                
+                initial_history = [
+                    {
+                        "role": "user",
+                        "parts": [file_obj]
+                    },
+                    {
+                        "role": "model",
+                        "parts": ["Understood. I have processed the document. What would you like to know?"]
+                    }
+                ]
+                
+                chat = model.start_chat(history=initial_history)
+                return chat
+
+            # If cache was successful, we start chat on the cached model
+            chat = model.start_chat(history=[])
+            return chat
 
     def cleanup_file(self, file_name):
         """
         Deletes the file from Gemini.
         """
-        try:
-            logger.info(f"Deleting file: {file_name}")
-            genai.delete_file(file_name)
-        except Exception as e:
-            logger.error(f"Error deleting file {file_name}: {e}")
+        if self.use_vertex:
+            # No explicit cleanup needed for Part.from_data as it's not stored on server
+            pass
+        else:
+            try:
+                logger.info(f"Deleting file: {file_name}")
+                genai.delete_file(file_name)
+            except Exception as e:
+                logger.error(f"Error deleting file {file_name}: {e}")
 
 
 class FileSearchRAG:
@@ -148,11 +200,32 @@ class FileSearchRAG:
         from google import genai as genai_client
         from google.genai import types
         
-        self.api_key = os.getenv("GOOGLE_API_KEY")
-        if not self.api_key:
-            raise ValueError("GOOGLE_API_KEY not found in environment variables")
+        self.use_vertex = os.getenv("USE_VERTEX_AI", "false").lower() == "true"
         
-        self.client = genai_client.Client(api_key=self.api_key)
+        if self.use_vertex:
+            # For Vertex AI, we use the same google.genai client but configured for Vertex
+            # The google-genai SDK supports both!
+            self.project_id = os.getenv("PROJECT_ID")
+            self.location = os.getenv("LOCATION", "us-central1")
+            
+            if not self.project_id:
+                 # Try to get from gcloud if not set
+                try:
+                    import google.auth
+                    _, self.project_id = google.auth.default()
+                except:
+                    pass
+            
+            if not self.project_id:
+                raise ValueError("PROJECT_ID env var required for Vertex AI mode")
+                
+            logger.info(f"Initializing File Search (Vertex AI) with project: {self.project_id}")
+            self.client = genai_client.Client(vertexai=True, project=self.project_id, location=self.location)
+        else:
+            self.api_key = os.getenv("GOOGLE_API_KEY")
+            if not self.api_key:
+                raise ValueError("GOOGLE_API_KEY not found in environment variables")
+            self.client = genai_client.Client(api_key=self.api_key)
         self.types = types
         # Use Gemini 2.5 Flash for File Search Tool
         self.model_name = os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash")
